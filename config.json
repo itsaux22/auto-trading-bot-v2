@@ -1,0 +1,6 @@
+{
+  "product_id": "BTC-USD",
+  "usd_per_day": 10,
+  "max_usd_per_week": 70,
+  "dry_run": true
+}
