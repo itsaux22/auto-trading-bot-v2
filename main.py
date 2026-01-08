@@ -67,7 +67,7 @@ def main():
 
 if __name__ == "__main__":
     main()
-    print("Bot finished successfully.")
-    import sys
-    sys.exit(0)
+    print("Bot finished successfully.", flush=True)
+    raise SystemExit(0)
+
 
