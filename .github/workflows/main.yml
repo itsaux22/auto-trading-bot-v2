@@ -1,4 +1,7 @@
-name: Daily Auto Bot
+- name: Run bot
+  run: |
+    ls -la
+    python -u -X faulthandler main.py
 
 on:
   schedule:
