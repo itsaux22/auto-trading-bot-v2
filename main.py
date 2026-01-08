@@ -67,21 +67,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import threading
+    print("Bot finished successfully.")
+    exit(0)
 
-def run_bot():
-    main()
-
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        threading.Thread(target=run_bot).start()
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot triggered")
-
-def start_server():
-    server = HTTPServer(("0.0.0.0", 5000), Handler)
-    server.serve_forever()
-
-start_server()
