@@ -1,7 +1,4 @@
-- name: Run bot
-  run: |
-    ls -la
-    python -u -X faulthandler main.py
+name: Daily Auto Bot
 
 on:
   schedule:
@@ -12,10 +9,17 @@ jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 2
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Run bot
-        run: python -u main.py
+        run: |
+          ls -la
+          python -u -X faulthandler main.py
