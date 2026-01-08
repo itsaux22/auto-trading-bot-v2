@@ -68,5 +68,6 @@ def main():
 if __name__ == "__main__":
     main()
     print("Bot finished successfully.")
-    exit(0)
+    import sys
+    sys.exit(0)
 
