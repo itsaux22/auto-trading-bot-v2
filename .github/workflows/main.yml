@@ -8,7 +8,7 @@ on:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 2
     steps:
       - uses: actions/checkout@v4
 
@@ -18,4 +18,4 @@ jobs:
           python-version: "3.11"
 
       - name: Run bot
-        run: python main.py
+        run: python -u main.py
