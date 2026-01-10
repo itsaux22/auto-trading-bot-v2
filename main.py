@@ -1,23 +1,24 @@
 import os
 import json
-import sys
 from datetime import datetime, timezone
-import urllib.request
-
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
 
 
+# ------------------------
+# Helpers
+# ------------------------
+
 def load_json(path, default):
     if not os.path.exists(path):
         return default
-    with open(path, "r", encoding="utf-8") as f:
+    with open(path, "r") as f:
         return json.load(f)
 
 
 def save_json(path, data):
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "w") as f:
         json.dump(data, f, indent=2)
 
 
@@ -26,139 +27,122 @@ def today_utc():
 
 
 def week_utc():
-    # ISO week string like "2026-W02"
     now = datetime.now(timezone.utc)
-    y, w, _ = now.isocalendar()
-    return f"{y}-W{w:02d}"
+    return f"{now.year}-W{now.isocalendar().week}"
 
 
-def get_spot_price_usd(product_id: str) -> float:
-    # Coinbase public endpoint (no API key needed)
-    url = f"https://api.coinbase.com/v2/prices/{product_id}/spot?currency=USD"
-    with urllib.request.urlopen(url, timeout=15) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-    return float(data["data"]["amount"])
-
-
-def validate_config(cfg: dict):
-    required = ["product_id", "usd_per_day", "max_usd_per_week", "dry_run"]
-    missing = [k for k in required if k not in cfg]
-    if missing:
-        print(f"CONFIG ERROR: Missing keys: {', '.join(missing)}")
-        sys.exit(1)
-
+# ------------------------
+# Main bot logic
+# ------------------------
 
 def main():
     print("Bot started")
 
+    # Load config
     config = load_json(CONFIG_PATH, {})
-    validate_config(config)
+    required_keys = [
+        "product_id",
+        "usd_per_day",
+        "max_usd_per_week",
+        "dry_run",
+        "min_drop_pct_to_buy",
+        "buy_if_no_last_price",
+    ]
 
-    # Default state if file doesn't exist
+    missing = [k for k in required_keys if k not in config]
+    if missing:
+        print(f"CONFIG ERROR: Missing keys: {', '.join(missing)}")
+        return
+
+    # Load state
     state = load_json(
         STATE_PATH,
         {
             "last_run_day": None,
-            "last_run_week": None,
+            "week": None,
             "spent_this_week": 0.0,
-            "last_price_usd": None,
+            "last_price": None,
         },
     )
 
-    # Reset weekly spend if we entered a new UTC week
-    current_week = week_utc()
-    if state.get("last_run_week") != current_week:
-        state["spent_this_week"] = 0.0
-        state["last_run_week"] = current_week
-
-    # Optional: prevent multiple runs per day
     today = today_utc()
-    if state.get("last_run_day") == today:
-        print(f"Already ran today ({today}). Skipping.")
-        save_json(STATE_PATH, state)
-        print("Bot finished successfully.")
+    week = week_utc()
+
+    # Reset weekly spend if new week
+    if state["week"] != week:
+        state["week"] = week
+        state["spent_this_week"] = 0.0
+
+    # Prevent multiple runs per day
+    if state["last_run_day"] == today:
+        print("Already ran today. Skipping.")
         return
 
-    product_id = config["product_id"]
-    usd_per_day = float(config["usd_per_day"])
-    max_usd_per_week = float(config["max_usd_per_week"])
-    dry_run = bool(config["dry_run"])
+    usd = float(config["usd_per_day"])
 
-    # --- Fetch price ---
-    try:
-        current_price = get_spot_price_usd(product_id)
-    except Exception as e:
-        print(f"PRICE ERROR: Could not fetch price for {product_id}: {e}")
-        sys.exit(1)
-
-    print(f"Current spot price for {product_id}: ${current_price:,.2f}")
-
-    # --- Weekly limit check ---
-    spent = float(state.get("spent_this_week", 0.0))
-    remaining = max_usd_per_week - spent
-    print(f"Weekly spent: ${spent:.2f} / ${max_usd_per_week:.2f} (remaining ${remaining:.2f})")
-
-    if remaining <= 0:
-        print("Weekly cap reached. No buy.")
-        state["last_run_day"] = today
-        save_json(STATE_PATH, state)
-        print("Bot finished successfully.")
+    if state["spent_this_week"] + usd > config["max_usd_per_week"]:
+        print("Weekly limit reached. Skipping buy.")
         return
 
-    # --- Decision logic (Stage 3) ---
-    min_drop = float(config.get("min_drop_pct_to_buy", 0.0))
-    buy_if_no_last = bool(config.get("buy_if_no_last_price", True))
-    last_price = state.get("last_price_usd")
+    # Read Coinbase secrets (Stage 4)
+    api_key = os.getenv("COINBASE_API_KEY")
+    api_secret = os.getenv("COINBASE_API_SECRET")
+
+    if api_key and api_secret:
+        print("[STAGE 4] Coinbase API keys detected.")
+    else:
+        print("[WARNING] Coinbase API keys NOT found.")
+        print("Bot will remain in DRY RUN mode.")
+
+    # ------------------------
+    # Price logic (stub for now)
+    # ------------------------
+
+    current_price = None  # Stage 5 will fetch real price
 
     should_buy = False
-    reason = ""
 
-    if last_price is None:
-        if buy_if_no_last:
+    if current_price is None:
+        if state["last_price"] is None and config["buy_if_no_last_price"]:
             should_buy = True
-            reason = "No last_price saved yet (first run) → allowed to buy."
         else:
-            should_buy = False
-            reason = "No last_price saved yet (first run) → configured to skip."
+            print("No price data available. Skipping buy.")
     else:
-        last_price = float(last_price)
-        drop_pct = (last_price - current_price) / last_price * 100.0
-        if drop_pct >= min_drop:
+        drop_pct = ((state["last_price"] - current_price) / state["last_price"]) * 100
+        if drop_pct >= config["min_drop_pct_to_buy"]:
             should_buy = True
-            reason = f"Price dropped {drop_pct:.2f}% (>= {min_drop:.2f}%) → buy condition met."
+
+    # ------------------------
+    # Execute (or simulate) trade
+    # ------------------------
+
+    if should_buy:
+        if config["dry_run"]:
+            print(
+                f"[DRY RUN] Would buy ${usd} of {config['product_id']}"
+            )
         else:
-            should_buy = False
-            reason = f"Price dropped {drop_pct:.2f}% (< {min_drop:.2f}%) → skip."
+            print(
+                f"[LIVE MODE] Buying ${usd} of {config['product_id']} (NOT IMPLEMENTED YET)"
+            )
 
-    print("Decision:", reason)
-
-    # Always store latest price so the next run can compare
-    state["last_price_usd"] = current_price
-
-    # Cap today's buy by remaining weekly budget
-    usd_to_use = min(usd_per_day, remaining)
-
-    if should_buy and usd_to_use > 0:
-        if dry_run:
-            print(f"[DRY RUN] Would buy ${usd_to_use:.2f} of {product_id}")
-        else:
-            print("[LIVE MODE] Trading not connected yet.")
-        # Only count spend when not dry_run
-        if not dry_run:
-            state["spent_this_week"] = float(state.get("spent_this_week", 0.0)) + usd_to_use
+        state["spent_this_week"] += usd
     else:
-        print("No buy today.")
+        print("Buy conditions not met.")
 
-    # Mark run day + save state
+    # Save state
     state["last_run_day"] = today
-    state["last_run_week"] = current_week
+    if current_price is not None:
+        state["last_price"] = current_price
+
     save_json(STATE_PATH, state)
 
     print("Bot finished successfully.")
 
 
+# ------------------------
+# Entry point
+# ------------------------
+
 if __name__ == "__main__":
     main()
-
-
-
