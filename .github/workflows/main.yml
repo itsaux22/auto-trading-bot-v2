@@ -19,7 +19,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run bot
-        run: |
-          ls -la
-          python -u -X faulthandler main.py
+- name: Run bot
+  env:
+    COINBASE_API_KEY: ${{ secrets.COINBASE_API_KEY }}
+    COINBASE_API_SECRET: ${{ secrets.COINBASE_API_SECRET }}
+  run: |
+    python -u main.py
+
