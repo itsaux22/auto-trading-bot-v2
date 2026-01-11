@@ -58,33 +58,53 @@ def looks_like_pem_private_key(s: str) -> bool:
     return "BEGIN" in s and "PRIVATE KEY" in s and "END" in s
 
 
+import secrets
+from cryptography.hazmat.primitives import serialization
+
 def build_cb_jwt(uri_path: str, method: str = "GET") -> str:
     """
-    Coinbase Advanced Trade uses JWT signed with your CDP private key (ES256).
+    Coinbase Advanced Trade (Coinbase App APIs) JWT:
+    - sub and kid must be the key name: organizations/{org_id}/apiKeys/{key_id}
+    - uri must be: "{METHOD} api.coinbase.com{path}"
     """
     if not COINBASE_API_KEY or not COINBASE_API_SECRET:
         raise RuntimeError("Missing COINBASE_API_KEY / COINBASE_API_SECRET env vars.")
 
-    if not looks_like_pem_private_key(COINBASE_API_SECRET):
+    key_name = COINBASE_API_KEY.strip()  # MUST be organizations/.../apiKeys/...
+    key_secret = COINBASE_API_SECRET.strip().strip('"').strip("'").replace("\\n", "\n")
+
+    if "organizations/" not in key_name or "/apiKeys/" not in key_name:
         raise RuntimeError(
-            "[STAGE 5] Coinbase secret does NOT look like a PEM private key.\n"
-            "You probably need a CDP Advanced Trade API key (ECDSA PEM) for this."
+            "COINBASE_API_KEY must be the full key name like:\n"
+            "organizations/{org_id}/apiKeys/{key_id}\n"
+            "Right now it looks like a short Key ID."
         )
 
+    private_key = serialization.load_pem_private_key(
+        key_secret.encode("utf-8"),
+        password=None
+    )
+
     now = int(time.time())
+    request_host = "api.coinbase.com"
+    uri = f"{method.upper()} {request_host}{uri_path}"
+
     payload = {
+        "sub": key_name,
         "iss": "cdp",
-        "sub": COINBASE_API_KEY,
         "nbf": now,
         "exp": now + 120,  # 2 minutes
-        "uri": f"{method.upper()} {uri_path}",
+        "uri": uri,
     }
 
     token = jwt.encode(
         payload,
-        COINBASE_API_SECRET,
+        private_key,
         algorithm="ES256",
-        headers={"kid": COINBASE_API_KEY},
+        headers={
+            "kid": key_name,
+            "nonce": secrets.token_hex(16),
+        },
     )
     return token
 
