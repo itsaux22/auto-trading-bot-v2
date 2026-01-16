@@ -2,7 +2,7 @@
   "product_id": "BTC-USD",
   "usd_per_day": 10,
   "max_usd_per_week": 70,
-  "dry_run": true,
+  "dry_run": false,
   "min_drop_pct_to_buy": 1.0,
   "buy_if_no_last_price": true
 }
