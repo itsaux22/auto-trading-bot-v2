@@ -3,9 +3,15 @@
   "usd_per_day": 10,
   "max_usd_per_week": 70,
   "dry_run": true,
-  "min_drop_pct_to_buy": 1.0,
-  "buy_if_no_last_price": true,
 
-  "trend_ma_minutes": 60,
-  "trend_ma_periods": 50
+  "mode": "swing",
+
+  "trend_ma_days": 50,
+  "rsi_days": 14,
+  "dip_from_high_pct": 2.0,
+
+  "take_profit_pct": 2.5,
+  "stop_loss_pct": 1.5,
+
+  "cooldown_hours": 12
 }
