@@ -1,13 +1,11 @@
 {
   "kill_switch": false,
 
-  "max_risk_pct_per_trade": 1.0,
+  "min_minutes_between_buys": 180,
   "max_total_usd_position": 300,
 
-  "max_daily_loss_pct": 2.0,
-  "max_weekly_loss_pct": 5.0,
+  "loss_trigger_pct": 3.0,
+  "cooldown_after_loss_hours": 24,
 
-  "cooldown_after_loss_hours": 24
+  "max_daily_spend": 20
 }
-
-
