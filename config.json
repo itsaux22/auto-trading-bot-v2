@@ -1,18 +1,13 @@
 {
-  "product_id": "BTC-USD",
-  "usd_per_day": 10,
-  "max_usd_per_week": 70,
+  "kill_switch": false,
 
-  "dry_run": true,
+  "max_risk_pct_per_trade": 1.0,
+  "max_total_usd_position": 300,
 
-  "min_drop_pct_to_buy": 1.0,
-  "buy_if_no_last_price": true,
+  "max_daily_loss_pct": 2.0,
+  "max_weekly_loss_pct": 5.0,
 
-  "enable_take_profit": true,
-  "take_profit_pct": 1.5,
-  "take_profit_sell_pct_of_position": 50,
-
-  "min_minutes_between_buys": 120,
-  "max_total_usd_position": 300
+  "cooldown_after_loss_hours": 24
 }
+
 
