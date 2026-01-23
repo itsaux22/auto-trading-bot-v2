@@ -1,11 +1,18 @@
 {
-  "kill_switch": false,
+  "product_id": "BTC-USD",
 
+  "usd_per_day": 10,
+  "max_usd_per_week": 70,
+
+  "dry_run": true,
+
+  "min_drop_pct_to_buy": 1.0,
+  "buy_if_no_last_price": true,
+
+  "kill_switch": false,
   "min_minutes_between_buys": 180,
   "max_total_usd_position": 300,
-
   "loss_trigger_pct": 3.0,
   "cooldown_after_loss_hours": 24,
-
   "max_daily_spend": 20
 }
