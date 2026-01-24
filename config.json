@@ -3,20 +3,6 @@
   "usd_per_day": 10,
   "max_usd_per_week": 70,
   "dry_run": true,
-
-  "entry_mode": "dip_and_trend",
-  "candle_granularity_sec": 300,
-  "lookback_candles": 200,
-
-  "sma_short": 20,
-  "sma_long": 60,
-  "rsi_period": 14,
-
-  "require_uptrend": true,
-  "max_rsi_to_buy": 55,
-  "dip_below_sma_short_pct": 0.6,
-  "min_intraday_drop_pct": 0.5,
-
-  "buy_if_no_last_price": true,
-  "min_minutes_between_buys": 720
+  "min_drop_pct_to_buy": 1.0,
+  "buy_if_no_last_price": true
 }
