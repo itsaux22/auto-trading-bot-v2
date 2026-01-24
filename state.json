@@ -1,16 +1,7 @@
 {
-  "week": "",
+  "week": null,
   "weekly_spent": 0,
-  "last_run_date": "",
-
-  "position": {
-    "is_open": false,
-    "product_id": "",
-    "entry_price": null,
-    "entry_time": "",
-    "client_order_id": "",
-    "peak_price": null
-  },
-
-  "cooldowns": {}
+  "last_price": null,
+  "last_buy_ts": 0,
+  "last_run": null
 }
