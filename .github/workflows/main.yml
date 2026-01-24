@@ -2,31 +2,29 @@ name: Daily Auto Bot
 
 on:
   schedule:
-    - cron: "0 9 * * *"   # runs daily at 09:00 UTC
+    - cron: "0 9 * * *"
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
 
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install coinbase-advanced-py requests
+          pip install coinbase-advanced-py
 
       - name: Run bot
         env:
           COINBASE_API_KEY: ${{ secrets.COINBASE_API_KEY }}
           COINBASE_API_SECRET: ${{ secrets.COINBASE_API_SECRET }}
         run: |
-          python -u main.py
+          python main.py
+
