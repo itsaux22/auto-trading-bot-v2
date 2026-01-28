@@ -27,4 +27,3 @@ jobs:
           COINBASE_API_SECRET: ${{ secrets.COINBASE_API_SECRET }}
         run: |
           python main.py
-
