@@ -3,6 +3,13 @@
   "usd_per_day": 10,
   "max_usd_per_week": 70,
   "dry_run": true,
+
   "min_drop_pct_to_buy": 1.0,
-  "buy_if_no_last_price": true
+  "buy_if_no_last_price": true,
+
+  "use_trend_filter": true,
+  "trend_fast_hours": 24,
+  "trend_slow_hours": 168,
+  "downtrend_mode": "stricter",
+  "downtrend_multiplier": 2.0
 }
