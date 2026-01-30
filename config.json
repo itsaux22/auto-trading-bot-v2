@@ -4,12 +4,12 @@
   "max_usd_per_week": 70,
   "dry_run": true,
 
-  "min_drop_pct_to_buy": 1.0,
-  "buy_if_no_last_price": true,
-
-  "use_trend_filter": true,
-  "trend_fast_hours": 24,
-  "trend_slow_hours": 168,
-  "downtrend_mode": "stricter",
-  "downtrend_multiplier": 2.0
+  "run_once_per_day": true,
+  "dip_threshold_pct": -1.0,
+  "lookback_hours": 24,
+  "min_volatility": 0.0,
+  "max_volatility": 1.0,
+  "cooldown_hours": 6,
+  "min_order_usd": 5.0,
+  "max_order_usd": 50.0
 }
