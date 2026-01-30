@@ -1,7 +1,7 @@
 {
-  "week": null,
-  "weekly_spent": 0,
-  "last_price": null,
-  "last_buy_ts": 0,
-  "last_run": null
+  "week_id": "",
+  "week_spent_usd": 0.0,
+  "last_run_day": "",
+  "last_buy_time": "",
+  "last_price": null
 }
