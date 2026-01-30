@@ -1,29 +1,39 @@
-import os
 import json
-import time
+import os
+import sys
 import uuid
-import math
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, Optional, Tuple, List
 
-# Coinbase Advanced Trade SDK
-# pip install coinbase-advanced-py
+# Coinbase Advanced Trade SDK (coinbase-advanced-py)
 from coinbase.rest import RESTClient
+
+
+CONFIG_PATH = "config.json"
+STATE_PATH = "state.json"
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def utc_today_str() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
-def iso_week_key(dt: datetime) -> str:
-    # e.g., "2026-W03"
-    y, w, _ = dt.isocalendar()
-    return f"{y}-W{w:02d}"
+def iso_today_utc() -> str:
+    return utc_now().date().isoformat()
 
 
-def load_json(path: str, default):
+def safe_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def load_json(path: str, default: Any) -> Any:
     if not os.path.exists(path):
         return default
     try:
@@ -33,400 +43,319 @@ def load_json(path: str, default):
         return default
 
 
-def save_json(path: str, data):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, path)
+def save_json(path: str, data: Any) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
 
 
-def must_get(cfg: dict, key: str):
-    if key not in cfg:
-        raise KeyError(key)
-    return cfg[key]
+def require_keys(cfg: Dict[str, Any], keys: List[str]) -> Tuple[bool, List[str]]:
+    missing = [k for k in keys if k not in cfg]
+    return (len(missing) == 0, missing)
 
 
-def to_float(x, default=None):
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def clamp(n, lo, hi):
-    return max(lo, min(hi, n))
+def get_week_id(dt: datetime) -> str:
+    # ISO week id like "2026-W03"
+    iso = dt.isocalendar()
+    return f"{iso.year}-W{iso.week:02d}"
 
 
 # ----------------------------
-# Coinbase wrappers
+# Coinbase API calls
 # ----------------------------
 def make_client() -> RESTClient:
     api_key = os.getenv("COINBASE_API_KEY", "").strip()
     api_secret = os.getenv("COINBASE_API_SECRET", "").strip()
 
     if not api_key or not api_secret:
-        raise RuntimeError("Missing COINBASE_API_KEY or COINBASE_API_SECRET env vars.")
+        print("CONFIG ERROR: Missing COINBASE_API_KEY / COINBASE_API_SECRET secrets.")
+        sys.exit(0)
 
-    # api_secret should be the PEM private key text (with BEGIN/END lines + newlines)
+    # IMPORTANT: api_secret must be the PEM (multi-line). No quotes needed in GitHub secret.
     return RESTClient(api_key=api_key, api_secret=api_secret)
 
 
-def read_only_check(client: RESTClient) -> int:
-    # If this works, auth is valid.
-    # The SDK returns an object; we just want to see if it doesn't throw.
-    resp = client.list_accounts()
-    # Best-effort count
+def read_only_check(client: RESTClient) -> bool:
     try:
-        accounts = getattr(resp, "accounts", None)
-        if accounts is None:
-            return 0
-        return len(accounts)
-    except Exception:
-        return 0
-
-
-def get_spot_price(client: RESTClient, product_id: str) -> float | None:
-    try:
-        product = client.get_product(product_id)
-        # SDK object may have different shapes; try common fields
-        price = getattr(product, "price", None)
-        if price is None and isinstance(product, dict):
-            price = product.get("price")
-        return to_float(price, None)
-    except Exception:
-        return None
-
-
-def get_hourly_closes(client: RESTClient, product_id: str, hours: int) -> list[float]:
-    """
-    Pull hourly candles and return closes (oldest -> newest).
-    Coinbase candle endpoint may return:
-      - dict with "candles"
-      - object with .candles
-    Each candle might be dict-like with "close".
-    """
-    end = int(time.time())
-    start = end - hours * 3600
-
-    try:
-        resp = client.get_product_candles(
-            product_id=product_id,
-            start=str(start),
-            end=str(end),
-            granularity="ONE_HOUR",
-        )
-    except Exception:
-        return []
-
-    candles = None
-    if isinstance(resp, dict):
-        candles = resp.get("candles")
-    else:
-        candles = getattr(resp, "candles", None)
-
-    if not candles:
-        return []
-
-    closes = []
-    for c in candles:
-        if isinstance(c, dict):
-            close = c.get("close")
+        # If this works, keys are valid.
+        resp = client.get_accounts()
+        # resp might be an object; just check it exists
+        count = getattr(resp, "accounts", None)
+        if isinstance(count, list):
+            print(f"[STAGE 5] Read-only check OK. accounts_count={len(count)}")
         else:
-            close = getattr(c, "close", None)
-
-        close_f = to_float(close, None)
-        if close_f is not None and close_f > 0:
-            closes.append(close_f)
-
-    # Coinbase often returns newest -> oldest; we want oldest -> newest
-    closes = list(reversed(closes))
-    return closes
+            # fallback
+            print("[STAGE 5] Read-only check OK.")
+        return True
+    except Exception as e:
+        print("[STAGE 5] Read-only check FAILED.")
+        print(f"Error: {e}")
+        return False
 
 
-def pct_change(new: float, old: float) -> float:
-    if old == 0:
-        return 0.0
-    return (new - old) / old * 100.0
-
-
-def get_7d_volatility(client: RESTClient, product_id: str) -> float | None:
-    closes = get_hourly_closes(client, product_id, hours=7 * 24)
-    if len(closes) < 30:
-        return None
-    rets = []
-    for i in range(1, len(closes)):
-        r = (closes[i] / closes[i - 1]) - 1.0
-        if math.isfinite(r):
-            rets.append(r)
-    if len(rets) < 10:
-        return None
-    # daily-ish volatility estimate from hourly returns
-    # stdev * sqrt(24*7) gives 7-day volatility scale
-    mean = sum(rets) / len(rets)
-    var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-    stdev = math.sqrt(max(var, 0.0))
-    vol = stdev * math.sqrt(24 * 7)
-    return vol
-
-
-def place_market_buy_usd(client: RESTClient, product_id: str, usd_amount: float) -> dict:
-    client_order_id = str(uuid.uuid4())
-    # Coinbase SDK order shape:
-    # order_configuration.market_market_ioc.quote_size = "<usd>"
-    resp = client.create_order(
-        client_order_id=client_order_id,
-        product_id=product_id,
-        side="BUY",
-        order_configuration={
-            "market_market_ioc": {
-                "quote_size": f"{usd_amount:.2f}"
-            }
-        }
-    )
-
-    # Normalize response to dict-ish output
-    out = {
-        "client_order_id": client_order_id,
-        "order_id": None,
-        "raw": None,
-    }
-
+def get_spot_price_usd(client: RESTClient, product_id: str) -> Optional[float]:
+    # We’ll use the product endpoint that includes price
     try:
-        if isinstance(resp, dict):
-            out["raw"] = resp
-            out["order_id"] = resp.get("order_id") or resp.get("id")
-        else:
-            out["raw"] = str(resp)
-            out["order_id"] = getattr(resp, "order_id", None) or getattr(resp, "id", None)
+        prod = client.get_product(product_id)
+        # coinbase-advanced-py returns an object; try common fields
+        price = getattr(prod, "price", None)
+        p = safe_float(price)
+        if p is not None:
+            return p
     except Exception:
         pass
 
-    return out
-
-
-# ----------------------------
-# Strategy / Bot
-# ----------------------------
-REQUIRED_CONFIG_KEYS = [
-    "product_id",
-    "usd_per_day",
-    "max_usd_per_week",
-    "dry_run",
-]
-
-DEFAULT_CONFIG = {
-    # REQUIRED:
-    "product_id": "BTC-USD",
-    "usd_per_day": 10,
-    "max_usd_per_week": 70,
-    "dry_run": True,
-
-    # OPTIONAL / recommended:
-    "run_once_per_day": True,          # prevents multiple buys same day
-    "dip_threshold_pct": -1.0,         # buy when price is <= (24h change) threshold (negative means dip)
-    "lookback_hours": 24,              # used to compare current vs past close
-    "min_volatility": 0.0,             # set >0 to only trade when vol is high enough
-    "max_volatility": 1.0,             # set lower to avoid extreme volatility
-    "cooldown_hours": 6,               # minimum time between buys
-    "min_order_usd": 5.00,             # don't place tiny orders
-    "max_order_usd": 50.00,            # safety cap per order
-}
-
-
-def load_config(path="config.json") -> dict:
-    cfg = load_json(path, DEFAULT_CONFIG.copy())
-    # Ensure defaults exist
-    for k, v in DEFAULT_CONFIG.items():
-        cfg.setdefault(k, v)
-
-    missing = [k for k in REQUIRED_CONFIG_KEYS if k not in cfg]
-    if missing:
-        print(f"CONFIG ERROR: Missing keys: {', '.join(missing)}")
-        # Show the template the user should paste
-        print("CONFIG TEMPLATE (config.json) should look like:")
-        print(json.dumps(DEFAULT_CONFIG, indent=2))
-        return {}
-
-    # Normalize types
-    cfg["usd_per_day"] = float(cfg["usd_per_day"])
-    cfg["max_usd_per_week"] = float(cfg["max_usd_per_week"])
-    cfg["dry_run"] = bool(cfg["dry_run"])
-    cfg["run_once_per_day"] = bool(cfg.get("run_once_per_day", True))
-    cfg["dip_threshold_pct"] = float(cfg.get("dip_threshold_pct", -1.0))
-    cfg["lookback_hours"] = int(cfg.get("lookback_hours", 24))
-    cfg["cooldown_hours"] = int(cfg.get("cooldown_hours", 6))
-    cfg["min_order_usd"] = float(cfg.get("min_order_usd", 5.0))
-    cfg["max_order_usd"] = float(cfg.get("max_order_usd", 50.0))
-    cfg["min_volatility"] = float(cfg.get("min_volatility", 0.0))
-    cfg["max_volatility"] = float(cfg.get("max_volatility", 1.0))
-
-    return cfg
-
-
-def load_state(path="state.json") -> dict:
-    return load_json(path, {
-        "week_key": None,
-        "weekly_spent": 0.0,
-        "last_run_date": None,
-        "last_buy_ts": None,
-        "last_buy_price": None,
-        "last_client_order_id": None,
-        "last_order_id": None
-    })
-
-
-def reset_week_if_needed(state: dict):
-    now = datetime.now(timezone.utc)
-    wk = iso_week_key(now)
-    if state.get("week_key") != wk:
-        state["week_key"] = wk
-        state["weekly_spent"] = 0.0
-
-
-def should_cooldown(state: dict, cooldown_hours: int) -> bool:
-    ts = state.get("last_buy_ts")
-    if not ts:
-        return False
+    # Fallback: try market trades and use last trade price
     try:
-        last = float(ts)
+        trades = client.get_market_trades(product_id=product_id, limit=1)
+        tlist = getattr(trades, "trades", None)
+        if isinstance(tlist, list) and len(tlist) > 0:
+            last_price = safe_float(getattr(tlist[0], "price", None))
+            return last_price
     except Exception:
-        return False
-    return (time.time() - last) < (cooldown_hours * 3600)
+        pass
+
+    return None
 
 
+def get_candles_hourly(client: RESTClient, product_id: str, hours: int) -> List[Dict[str, Any]]:
+    """
+    Returns a list of candles with at least 'close' if available.
+    If API fails / returns nothing, returns [] (never None).
+    """
+    end = utc_now()
+    start = end - timedelta(hours=hours)
+
+    try:
+        # granularity: 3600 seconds = 1 hour
+        resp = client.get_product_candles(
+            product_id=product_id,
+            start=int(start.timestamp()),
+            end=int(end.timestamp()),
+            granularity=3600,
+        )
+        candles = getattr(resp, "candles", None)
+        if not isinstance(candles, list):
+            return []
+        # Normalize to dict-like items
+        out = []
+        for c in candles:
+            # c might be dict or object with attributes
+            if isinstance(c, dict):
+                out.append(c)
+            else:
+                out.append({
+                    "close": getattr(c, "close", None),
+                    "start": getattr(c, "start", None),
+                })
+        return out
+    except Exception:
+        return []
+
+
+def calc_7d_volatility_from_hourly(client: RESTClient, product_id: str) -> Optional[float]:
+    candles = get_candles_hourly(client, product_id, hours=7 * 24)
+    closes: List[float] = []
+    for c in candles:
+        v = safe_float(c.get("close"))
+        if v is not None and v > 0:
+            closes.append(v)
+
+    # Need enough data points
+    if len(closes) < 24:
+        return None
+
+    # Simple volatility proxy: (max-min)/mean over window
+    mn = min(closes)
+    mx = max(closes)
+    mean = sum(closes) / len(closes)
+    if mean <= 0:
+        return None
+    return (mx - mn) / mean
+
+
+def place_market_buy_usd(client: RESTClient, product_id: str, usd_amount: float) -> Tuple[bool, str]:
+    """
+    Places a market buy using quote size (USD). Returns (ok, message).
+    """
+    client_order_id = str(uuid.uuid4())
+
+    try:
+        resp = client.create_order(
+            client_order_id=client_order_id,
+            product_id=product_id,
+            side="BUY",
+            order_configuration={
+                "market_market_ioc": {
+                    "quote_size": str(round(usd_amount, 2))
+                }
+            }
+        )
+
+        # Many SDK responses have success + order_id; we log what we can safely.
+        order_id = getattr(resp, "order_id", None)
+        print("[STAGE 6] Order placed.")
+        print(f"[STAGE 6] client_order_id={client_order_id}")
+        print(f"[STAGE 6] order_id={order_id}")
+        return True, f"Placed order client_order_id={client_order_id} order_id={order_id}"
+    except Exception as e:
+        return False, f"Order FAILED: {e}"
+
+
+# ----------------------------
+# Main logic
+# ----------------------------
 def main():
     print("Bot started")
 
-    cfg = load_config("config.json")
-    if not cfg:
+    cfg = load_json(CONFIG_PATH, {})
+    ok, missing = require_keys(cfg, ["product_id", "usd_per_day", "max_usd_per_week", "dry_run"])
+    if not ok:
+        print(f"CONFIG ERROR: Missing keys: {', '.join(missing)}")
         print("Bot finished successfully.")
         return
 
-    product_id = cfg["product_id"]
-    usd_per_day = cfg["usd_per_day"]
-    max_usd_per_week = cfg["max_usd_per_week"]
-    dry_run = cfg["dry_run"]
+    # Optional tuning keys with defaults
+    run_once_per_day = bool(cfg.get("run_once_per_day", True))
+    dip_threshold_pct = float(cfg.get("dip_threshold_pct", -1.0))   # -1.0 means buy if price <= last_price * (1 - 0.01)
+    lookback_hours = int(cfg.get("lookback_hours", 24))
+    min_vol = float(cfg.get("min_volatility", 0.0))
+    max_vol = float(cfg.get("max_volatility", 1.0))
+    cooldown_hours = int(cfg.get("cooldown_hours", 6))
+    min_order_usd = float(cfg.get("min_order_usd", 5.0))
+    max_order_usd = float(cfg.get("max_order_usd", 50.0))
 
-    state_path = "state.json"
-    state = load_state(state_path)
-    reset_week_if_needed(state)
+    product_id = str(cfg["product_id"])
+    usd_per_day = float(cfg["usd_per_day"])
+    max_usd_per_week = float(cfg["max_usd_per_week"])
+    dry_run = bool(cfg["dry_run"])
 
-    # Optional "run once per day"
-    today = utc_today_str()
-    if cfg.get("run_once_per_day", True) and state.get("last_run_date") == today:
+    usd_per_day = max(0.0, usd_per_day)
+    usd_per_day = min(usd_per_day, max_order_usd)
+    usd_per_day = max(usd_per_day, min_order_usd) if usd_per_day > 0 else 0.0
+
+    # Load state
+    state = load_json(STATE_PATH, {})
+    today = iso_today_utc()
+    now = utc_now()
+    week_id = get_week_id(now)
+
+    # Initialize state keys safely
+    state.setdefault("week_id", week_id)
+    state.setdefault("week_spent_usd", 0.0)
+    state.setdefault("last_run_day", "")
+    state.setdefault("last_buy_time", "")
+    state.setdefault("last_price", None)
+
+    # Reset weekly spend if week changed
+    if state.get("week_id") != week_id:
+        state["week_id"] = week_id
+        state["week_spent_usd"] = 0.0
+
+    # Run-once-per-day gate
+    if run_once_per_day and state.get("last_run_day") == today:
         print(f"Already ran today ({today}). Exiting.")
         print("Bot finished successfully.")
         return
 
-    # Connect + auth test
+    # Cooldown gate
+    last_buy_time = state.get("last_buy_time", "")
+    if last_buy_time:
+        try:
+            t = datetime.fromisoformat(last_buy_time.replace("Z", "+00:00"))
+            if (now - t) < timedelta(hours=cooldown_hours):
+                print(f"Decision: SKIP | Cooldown active ({cooldown_hours}h)")
+                state["last_run_day"] = today
+                save_json(STATE_PATH, state)
+                print("Bot finished successfully.")
+                return
+        except Exception:
+            pass
+
+    # Coinbase client + read-only check
     client = make_client()
+    read_only_check(client)
 
-    print("[STAGE 5] Coinbase keys detected. Trying read-only account list...")
-    try:
-        count = read_only_check(client)
-        print(f"[STAGE 5] Read-only check OK. accounts_count={count}")
-    except Exception as e:
-        print("[STAGE 5] Read-only check FAILED.")
-        print(f"Error: {e}")
-        # still continue in dry run mode to show decision logic
-        count = 0
-
-    price = get_spot_price(client, product_id)
+    # Get current price
+    price = get_spot_price_usd(client, product_id)
     if price is None:
-        print(f"ERROR: Could not fetch spot price for {product_id}.")
-        state["last_run_date"] = today
-        save_json(state_path, state)
+        print("Error: Could not fetch current price.")
+        state["last_run_day"] = today
+        save_json(STATE_PATH, state)
         print("Bot finished successfully.")
         return
 
     print(f"Current spot price for {product_id}: ${price:,.2f}")
 
-    weekly_spent = float(state.get("weekly_spent", 0.0) or 0.0)
-    remaining_week = max(0.0, max_usd_per_week - weekly_spent)
-    print(f"Weekly spent: ${weekly_spent:,.2f} / ${max_usd_per_week:,.2f} (remaining ${remaining_week:,.2f})")
+    # Weekly budget gate
+    week_spent = float(state.get("week_spent_usd", 0.0))
+    remaining_week = max(0.0, max_usd_per_week - week_spent)
+    print(f"Weekly spent: ${week_spent:,.2f} / ${max_usd_per_week:,.2f} (remaining ${remaining_week:,.2f})")
 
-    # Decide order size (safety caps)
-    order_usd = clamp(usd_per_day, cfg["min_order_usd"], cfg["max_order_usd"])
-    order_usd = min(order_usd, remaining_week)
-
-    if order_usd < cfg["min_order_usd"]:
-        print("Decision: SKIP | Weekly limit reached (or order too small).")
-        state["last_run_date"] = today
-        save_json(state_path, state)
-        print("Bot finished successfully.")
-        return
-
-    # Cooldown between buys
-    if should_cooldown(state, cfg["cooldown_hours"]):
-        print(f"Decision: SKIP | Cooldown active ({cfg['cooldown_hours']}h).")
-        state["last_run_date"] = today
-        save_json(state_path, state)
+    if remaining_week < min_order_usd or usd_per_day <= 0:
+        print("Decision: SKIP | Weekly budget exhausted or daily amount is 0")
+        state["last_run_day"] = today
+        save_json(STATE_PATH, state)
         print("Bot finished successfully.")
         return
 
     # Volatility filter (optional)
-    vol = get_7d_volatility(client, product_id)
+    vol = calc_7d_volatility_from_hourly(client, product_id)
     if vol is not None:
-        if vol < cfg["min_volatility"] or vol > cfg["max_volatility"]:
-            print(f"Decision: SKIP | Volatility out of range. 7d_vol={vol:.4f}")
-            state["last_run_date"] = today
-            save_json(state_path, state)
+        # vol is fraction, e.g. 0.12 = 12%
+        if not (min_vol <= vol <= max_vol):
+            print(f"Decision: SKIP | Volatility {vol:.3f} outside [{min_vol:.3f}, {max_vol:.3f}]")
+            state["last_run_day"] = today
+            save_json(STATE_PATH, state)
             print("Bot finished successfully.")
             return
-
-    # Dip check using lookback close
-    lookback_h = max(1, int(cfg["lookback_hours"]))
-    closes = get_hourly_closes(client, product_id, hours=lookback_h + 2)
-    if len(closes) < 2:
-        # No candle data -> safest is skip unless you want always-buy DCA
-        # Here we do "buy allowed" only if dip_threshold_pct >= 0 (meaning you want DCA always).
-        if cfg["dip_threshold_pct"] < 0:
-            print("Decision: SKIP | Not enough candle data for dip check.")
-            state["last_run_date"] = today
-            save_json(state_path, state)
-            print("Bot finished successfully.")
-            return
-        else:
-            print("Decision: BUY | No candles, but DCA mode enabled.")
     else:
-        past = closes[0]
-        change = pct_change(price, past)
-        threshold = cfg["dip_threshold_pct"]
-        if change <= threshold:
-            print(f"Decision: BUY | Dip detected ({change:.2f}% over ~{lookback_h}h, threshold {threshold:.2f}%)")
-        else:
-            print(f"Decision: SKIP | Not a dip yet ({change:.2f}% over ~{lookback_h}h, threshold {threshold:.2f}%)")
-            state["last_run_date"] = today
-            save_json(state_path, state)
-            print("Bot finished successfully.")
-            return
+        print("Note: Volatility unavailable (not enough candle data). Continuing.")
 
-    # Execute
+    # Dip rule using last_price stored
+    last_price = safe_float(state.get("last_price"))
+    buy = False
+    if last_price is None:
+        print("Decision: BUY | No last_price yet -> first buy allowed")
+        buy = True
+    else:
+        # dip_threshold_pct is negative for “dip”
+        threshold = last_price * (1.0 + (dip_threshold_pct / 100.0))
+        if price <= threshold:
+            print(f"Decision: BUY | Price ${price:,.2f} <= threshold ${threshold:,.2f}")
+            buy = True
+        else:
+            print("Decision: SKIP | Not a dip yet")
+
+    # Record run day always
+    state["last_run_day"] = today
+
+    if not buy:
+        state["last_price"] = price
+        save_json(STATE_PATH, state)
+        print("Bot finished successfully.")
+        return
+
+    # Decide order size (cap by remaining weekly)
+    order_usd = min(usd_per_day, remaining_week)
+    order_usd = max(min_order_usd, min(order_usd, max_order_usd))
+
     if dry_run:
-        print(f"[DRY RUN] Would buy ${order_usd:.2f} of {product_id}")
-        state["last_run_date"] = today
-        save_json(state_path, state)
+        print(f"[DRY RUN] Would buy ${order_usd:,.2f} of {product_id}")
+        state["last_price"] = price
+        save_json(STATE_PATH, state)
         print("Bot finished successfully.")
         return
 
     print("[STAGE 6] LIVE MODE enabled. Placing real order...")
-    try:
-        res = place_market_buy_usd(client, product_id, order_usd)
-        print("[STAGE 6] Order placed.")
-        print(f"[STAGE 6] client_order_id={res.get('client_order_id')}")
-        print(f"[STAGE 6] order_id={res.get('order_id')}")
-        # Update state
-        state["weekly_spent"] = float(state.get("weekly_spent", 0.0) or 0.0) + float(order_usd)
-        state["last_buy_ts"] = time.time()
-        state["last_buy_price"] = price
-        state["last_client_order_id"] = res.get("client_order_id")
-        state["last_order_id"] = res.get("order_id")
-    except Exception as e:
-        print("[STAGE 6] Order FAILED.")
-        print(f"Error: {e}")
+    ok, msg = place_market_buy_usd(client, product_id, order_usd)
+    print(f"[STAGE 6] {msg}")
 
-    state["last_run_date"] = today
-    save_json(state_path, state)
+    if ok:
+        state["week_spent_usd"] = float(state.get("week_spent_usd", 0.0)) + order_usd
+        state["last_buy_time"] = utc_now().isoformat().replace("+00:00", "Z")
+        state["last_price"] = price
+
+    save_json(STATE_PATH, state)
     print("Bot finished successfully.")
 
 
