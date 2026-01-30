@@ -7,9 +7,12 @@
   "run_once_per_day": true,
   "dip_threshold_pct": -1.0,
   "lookback_hours": 24,
+
   "min_volatility": 0.0,
   "max_volatility": 1.0,
+
   "cooldown_hours": 6,
+
   "min_order_usd": 5.0,
   "max_order_usd": 50.0
 }
