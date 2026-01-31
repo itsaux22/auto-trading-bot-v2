@@ -8,22 +8,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-# Coinbase Advanced Trade SDK (installed via coinbase-advanced-py)
-# Your workflow installs this already.
 try:
     from coinbase.rest import RESTClient
 except Exception:
-    RESTClient = None  # We'll still allow DRY RUN + public price checks
-
-
-# -----------------------------
-# Helpers: files + time
-# -----------------------------
+    RESTClient = None
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
-
-EXCHANGE_API_BASE = "https://api.exchange.coinbase.com"  # public (candles + ticker)
+EXCHANGE_API_BASE = "https://api.exchange.coinbase.com"
 
 
 def utc_now() -> dt.datetime:
@@ -66,7 +58,7 @@ def to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
 
 
 # -----------------------------
-# Config + State (Upgrade #1)
+# Config (Upgrade #1)
 # -----------------------------
 
 REQUIRED_KEYS = ["product_id", "usd_per_day", "max_usd_per_week", "dry_run"]
@@ -78,28 +70,37 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_usd_per_week": 70,
     "dry_run": True,
 
-    # safety + behavior
-    "run_once_per_day": True,     # prevents double-buy in same day
-    "cooldown_hours": 6,          # after a buy, wait this many hours
+    # safety
+    "run_once_per_day": True,
+    "cooldown_hours": 6,
 
-    # signal
-    "lookback_hours": 24,         # candles lookback for dip calc
-    "dip_threshold_pct": -1.0,    # buy if price is <= (recent_high * (1 + threshold/100))
-    "min_volatility": 0.0,        # optional filter (0 disables)
-    "max_volatility": 1.0,        # optional filter (1 disables)
+    # dip signal
+    "lookback_hours": 24,
+    "dip_threshold_pct": -1.0,
 
-    # order sizing clamps
+    # NEW: trend + crash protection
+    "trend_filter_enabled": True,
+    "trend_sma_hours": 72,           # baseline trend (3 days)
+    "trend_min_pct_above_sma": -0.5, # allow small dips below SMA (in %)
+    "kill_switch_enabled": True,
+    "kill_switch_lookback_hours": 168,   # 7 days
+    "kill_switch_drawdown_pct": -10.0,   # if current is <= (7d high * (1-10%)) -> stop buying
+
+    # NEW: dip scaling (bigger dip -> bigger buy)
+    "dip_scaling_enabled": True,
+    "dip_scaling_max_mult": 2.0,     # at most 2x usd_per_day
+    "dip_scaling_full_mult_at_pct": -5.0, # reach max_mult at -5% dip (or deeper)
+
+    # order clamps
     "min_order_usd": 5.0,
     "max_order_usd": 50.0,
 
-    # logging verbosity
     "debug": False
 }
 
 
 def load_config() -> Dict[str, Any]:
     cfg = load_json(CONFIG_PATH, {})
-    # merge defaults
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg if isinstance(cfg, dict) else {})
 
@@ -107,16 +108,23 @@ def load_config() -> Dict[str, Any]:
     if missing:
         raise ValueError(f"CONFIG ERROR: Missing keys: {', '.join(missing)}")
 
-    # normalize numeric fields
+    # normalize
     merged["usd_per_day"] = float(merged["usd_per_day"])
     merged["max_usd_per_week"] = float(merged["max_usd_per_week"])
     merged["lookback_hours"] = int(merged["lookback_hours"])
     merged["dip_threshold_pct"] = float(merged["dip_threshold_pct"])
     merged["cooldown_hours"] = float(merged["cooldown_hours"])
+
+    merged["trend_sma_hours"] = int(merged["trend_sma_hours"])
+    merged["trend_min_pct_above_sma"] = float(merged["trend_min_pct_above_sma"])
+    merged["kill_switch_lookback_hours"] = int(merged["kill_switch_lookback_hours"])
+    merged["kill_switch_drawdown_pct"] = float(merged["kill_switch_drawdown_pct"])
+
+    merged["dip_scaling_max_mult"] = float(merged["dip_scaling_max_mult"])
+    merged["dip_scaling_full_mult_at_pct"] = float(merged["dip_scaling_full_mult_at_pct"])
+
     merged["min_order_usd"] = float(merged["min_order_usd"])
     merged["max_order_usd"] = float(merged["max_order_usd"])
-    merged["min_volatility"] = float(merged["min_volatility"])
-    merged["max_volatility"] = float(merged["max_volatility"])
 
     return merged
 
@@ -125,11 +133,10 @@ def load_state() -> Dict[str, Any]:
     st = load_json(STATE_PATH, {})
     if not isinstance(st, dict):
         st = {}
-    # defaults
     st.setdefault("week", week_id())
     st.setdefault("weekly_spent", 0.0)
     st.setdefault("last_run_date", "")
-    st.setdefault("last_buy_ts", 0)      # unix seconds
+    st.setdefault("last_buy_ts", 0)
     st.setdefault("last_buy_price", None)
     return st
 
@@ -142,13 +149,10 @@ def reset_week_if_needed(st: Dict[str, Any]) -> None:
 
 
 # -----------------------------
-# Market data (public endpoints)
+# Market data
 # -----------------------------
 
 def get_spot_price(product_id: str) -> float:
-    """
-    Uses Coinbase Exchange public ticker endpoint.
-    """
     url = f"{EXCHANGE_API_BASE}/products/{product_id}/ticker"
     r = requests.get(url, timeout=10)
     r.raise_for_status()
@@ -160,18 +164,9 @@ def get_spot_price(product_id: str) -> float:
 
 
 def get_hourly_closes(product_id: str, hours: int) -> List[float]:
-    """
-    Public candles endpoint: returns list of [time, low, high, open, close, volume]
-    We parse closes and return ascending by time.
-    """
     end = utc_now()
     start = end - dt.timedelta(hours=hours)
-
-    params = {
-        "start": start.isoformat(),
-        "end": end.isoformat(),
-        "granularity": 3600
-    }
+    params = {"start": start.isoformat(), "end": end.isoformat(), "granularity": 3600}
     url = f"{EXCHANGE_API_BASE}/products/{product_id}/candles"
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
@@ -180,10 +175,8 @@ def get_hourly_closes(product_id: str, hours: int) -> List[float]:
     if not isinstance(candles, list) or len(candles) == 0:
         return []
 
-    # candles are often returned newest-first, so sort by time
     parsed: List[Tuple[int, float]] = []
     for c in candles:
-        # expected: [time, low, high, open, close, volume]
         if not isinstance(c, list) or len(c) < 5:
             continue
         t = int(c[0])
@@ -196,31 +189,13 @@ def get_hourly_closes(product_id: str, hours: int) -> List[float]:
     return [p[1] for p in parsed]
 
 
-def calc_volatility(closes: List[float]) -> float:
-    """
-    Simple realized volatility proxy from hourly returns.
-    Returns a 0..~ range (not annualized). Safe + stable.
-    """
-    if len(closes) < 10:
-        return 0.0
-    rets = []
-    for i in range(1, len(closes)):
-        if closes[i - 1] <= 0:
-            continue
-        rets.append((closes[i] / closes[i - 1]) - 1.0)
-    if len(rets) < 5:
-        return 0.0
-    mean = sum(rets) / len(rets)
-    var = sum((x - mean) ** 2 for x in rets) / (len(rets) - 1)
-    return math.sqrt(var)
+def sma(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    return sum(values) / len(values)
 
 
 def is_dip(current: float, closes: List[float], dip_threshold_pct: float) -> Tuple[bool, float, float]:
-    """
-    Dip rule:
-    dip_pct = (current - recent_high) / recent_high * 100
-    buy when dip_pct <= dip_threshold_pct  (negative threshold)
-    """
     if not closes:
         return False, 0.0, current
     recent_high = max(closes)
@@ -230,32 +205,28 @@ def is_dip(current: float, closes: List[float], dip_threshold_pct: float) -> Tup
     return (dip_pct <= dip_threshold_pct), dip_pct, recent_high
 
 
+def pct_from(a: float, b: float) -> float:
+    # percent difference of a relative to b
+    if b == 0:
+        return 0.0
+    return (a - b) / b * 100.0
+
+
 # -----------------------------
 # Coinbase client + orders
 # -----------------------------
 
 def make_client() -> Optional[Any]:
-    """
-    Creates Coinbase Advanced Trade RESTClient using:
-      COINBASE_API_KEY    (key id)
-      COINBASE_API_SECRET (PEM private key)
-    """
     api_key = os.getenv("COINBASE_API_KEY", "").strip()
     api_secret = os.getenv("COINBASE_API_SECRET", "").strip()
-
     if not api_key or not api_secret:
         return None
     if RESTClient is None:
         return None
-
     return RESTClient(api_key=api_key, api_secret=api_secret)
 
 
 def safe_to_dict(obj: Any) -> Dict[str, Any]:
-    """
-    Different SDK versions return different response shapes.
-    This tries a few ways to normalize.
-    """
     if obj is None:
         return {}
     if isinstance(obj, dict):
@@ -267,30 +238,22 @@ def safe_to_dict(obj: Any) -> Dict[str, Any]:
                 return fn()
             except Exception:
                 pass
-    # fallback: try __dict__
     try:
-        d = dict(obj.__dict__)
-        return d
+        return dict(obj.__dict__)
     except Exception:
         return {}
 
 
 def place_market_buy(client: Any, product_id: str, usd_amount: float) -> Dict[str, Any]:
-    """
-    Coinbase Advanced Trade market order (IOC) by quote size.
-    """
     payload = {
         "client_order_id": str(uuid.uuid4()),
         "product_id": product_id,
         "side": "BUY",
         "order_configuration": {
-            "market_market_ioc": {
-                "quote_size": f"{usd_amount:.2f}"
-            }
+            "market_market_ioc": {"quote_size": f"{usd_amount:.2f}"}
         }
     }
 
-    # Try common call patterns across SDK versions
     if hasattr(client, "create_order"):
         try:
             resp = client.create_order(**payload)
@@ -303,26 +266,66 @@ def place_market_buy(client: Any, product_id: str, usd_amount: float) -> Dict[st
 
 
 def read_only_check_accounts(client: Any) -> int:
-    """
-    Optional read-only health check. Returns number of accounts if possible.
-    """
-    if client is None:
+    if client is None or not hasattr(client, "list_accounts"):
         return 0
-    if hasattr(client, "list_accounts"):
-        resp = client.list_accounts()
-        data = safe_to_dict(resp)
-
-        # try common shapes
-        if isinstance(data.get("accounts"), list):
-            return len(data["accounts"])
-
-        # some versions store inside nested keys
-        for k in ("accounts", "data", "result"):
-            v = data.get(k)
-            if isinstance(v, list):
-                return len(v)
-
+    resp = client.list_accounts()
+    data = safe_to_dict(resp)
+    if isinstance(data.get("accounts"), list):
+        return len(data["accounts"])
+    for k in ("accounts", "data", "result"):
+        v = data.get(k)
+        if isinstance(v, list):
+            return len(v)
     return 0
+
+
+# -----------------------------
+# Risk controls (Upgrade #1)
+# -----------------------------
+
+def trend_ok(current: float, trend_closes: List[float], min_pct_above_sma: float) -> Tuple[bool, Optional[float], float]:
+    """
+    Pass if current is not too far below SMA.
+    Returns: ok, sma_value, pct_vs_sma
+    """
+    s = sma(trend_closes)
+    if s is None:
+        return True, None, 0.0  # if no data, don't block
+    pct_vs = pct_from(current, s)
+    return (pct_vs >= min_pct_above_sma), s, pct_vs
+
+
+def kill_switch_ok(current: float, closes_7d: List[float], drawdown_threshold_pct: float) -> Tuple[bool, Optional[float], Optional[float]]:
+    """
+    If current is way below the 7d high (drawdown <= threshold), stop buying.
+    drawdown_threshold_pct should be negative (e.g. -10.0).
+    """
+    if not closes_7d:
+        return True, None, None
+    high = max(closes_7d)
+    if high <= 0:
+        return True, None, None
+    dd_pct = (current - high) / high * 100.0
+    # ok if drawdown is not worse than threshold
+    return (dd_pct > drawdown_threshold_pct), high, dd_pct
+
+
+def dip_scaled_amount(base_usd: float, dip_pct: float, full_mult_at_pct: float, max_mult: float) -> float:
+    """
+    Scale buy size based on dip depth.
+    - full_mult_at_pct is negative (e.g. -5.0) where we reach max_mult.
+    - dip_pct is negative when dipping.
+    """
+    if dip_pct >= 0:
+        return base_usd
+
+    # Convert dip depth to 0..1 scale:
+    # at dip=0 => 0, at dip=full_mult_at_pct (e.g. -5%) => 1, deeper => 1
+    denom = abs(full_mult_at_pct) if full_mult_at_pct != 0 else 1.0
+    t = min(1.0, abs(dip_pct) / denom)
+
+    mult = 1.0 + (max_mult - 1.0) * t
+    return base_usd * mult
 
 
 # -----------------------------
@@ -342,7 +345,6 @@ def main() -> None:
     st = load_state()
     reset_week_if_needed(st)
 
-    # optional: only once per day
     today = iso_date()
     if cfg.get("run_once_per_day", True) and st.get("last_run_date") == today:
         print(f"Already ran today ({today}). Exiting.")
@@ -351,7 +353,6 @@ def main() -> None:
 
     product_id = cfg["product_id"]
 
-    # Stage 5-like health check
     client = make_client()
     if client is None:
         print("[STAGE 5] Coinbase keys not detected (or SDK missing). Running DRY-only market checks.")
@@ -363,7 +364,7 @@ def main() -> None:
             print("[STAGE 5] Read-only check FAILED.")
             print(f"Error: {e}")
 
-    # Market data
+    # Spot
     try:
         spot = get_spot_price(product_id)
         print(f"Current spot price for {product_id}: ${spot:,.2f}")
@@ -374,7 +375,7 @@ def main() -> None:
         print("Bot finished successfully.")
         return
 
-    # Weekly spend guard
+    # Weekly cap
     weekly_spent = float(st.get("weekly_spent", 0.0))
     weekly_remaining = max(0.0, cfg["max_usd_per_week"] - weekly_spent)
     print(f"Weekly spent: ${weekly_spent:,.2f} / ${cfg['max_usd_per_week']:,.2f} (remaining ${weekly_remaining:,.2f})")
@@ -386,7 +387,7 @@ def main() -> None:
         print("Bot finished successfully.")
         return
 
-    # Cooldown guard
+    # Cooldown
     last_buy_ts = int(st.get("last_buy_ts", 0))
     if last_buy_ts > 0:
         hours_since = (time.time() - last_buy_ts) / 3600.0
@@ -397,47 +398,88 @@ def main() -> None:
             print("Bot finished successfully.")
             return
 
-    # Signal: dip + volatility
-    closes = []
+    # Dip lookback candles
     try:
-        closes = get_hourly_closes(product_id, cfg["lookback_hours"])
+        dip_closes = get_hourly_closes(product_id, cfg["lookback_hours"])
     except Exception as e:
         if cfg.get("debug"):
-            print(f"DEBUG: candle fetch failed: {e}")
-        closes = []
+            print(f"DEBUG: dip candle fetch failed: {e}")
+        dip_closes = []
 
-    vol = calc_volatility(closes) if closes else 0.0
-    dip_ok, dip_pct, recent_high = is_dip(spot, closes, cfg["dip_threshold_pct"])
+    dip_ok, dip_pct, recent_high = is_dip(spot, dip_closes, cfg["dip_threshold_pct"])
 
-    # Volatility filter is optional; defaults (0..1) are essentially "allow"
-    vol_ok = (vol >= cfg["min_volatility"]) and (vol <= cfg["max_volatility"])
-
-    if closes:
-        print(f"Lookback high ({cfg['lookback_hours']}h): ${recent_high:,.2f} | dip_pct={dip_pct:.2f}% | vol={vol:.5f}")
+    if dip_closes:
+        print(f"Lookback high ({cfg['lookback_hours']}h): ${recent_high:,.2f} | dip_pct={dip_pct:.2f}% (threshold {cfg['dip_threshold_pct']}%)")
     else:
-        print("Lookback candles unavailable (using safe default: NO DIP).")
+        print("Lookback candles unavailable (safe default: NO DIP).")
+        dip_ok = False
 
-    if not closes or not dip_ok:
+    if not dip_ok:
         print("Decision: SKIP | Not a dip yet")
         st["last_run_date"] = today
         save_json(STATE_PATH, st)
         print("Bot finished successfully.")
         return
 
-    if not vol_ok:
-        print("Decision: SKIP | Volatility filter not met")
-        st["last_run_date"] = today
-        save_json(STATE_PATH, st)
-        print("Bot finished successfully.")
-        return
+    # NEW: Trend filter
+    if cfg.get("trend_filter_enabled", True):
+        try:
+            trend_closes = get_hourly_closes(product_id, cfg["trend_sma_hours"])
+        except Exception as e:
+            if cfg.get("debug"):
+                print(f"DEBUG: trend candle fetch failed: {e}")
+            trend_closes = []
 
-    # Determine order amount
-    usd_amount = min(cfg["usd_per_day"], weekly_remaining)
+        ok, s, pct_vs = trend_ok(spot, trend_closes, cfg["trend_min_pct_above_sma"])
+        if s is not None:
+            print(f"Trend SMA({cfg['trend_sma_hours']}h): ${s:,.2f} | price_vs_sma={pct_vs:.2f}% (min {cfg['trend_min_pct_above_sma']}%)")
+        else:
+            print("Trend SMA unavailable (not blocking).")
+
+        if not ok:
+            print("Decision: SKIP | Trend filter says downtrend (avoiding falling knife).")
+            st["last_run_date"] = today
+            save_json(STATE_PATH, st)
+            print("Bot finished successfully.")
+            return
+
+    # NEW: Kill-switch (crash guard)
+    if cfg.get("kill_switch_enabled", True):
+        try:
+            closes_7d = get_hourly_closes(product_id, cfg["kill_switch_lookback_hours"])
+        except Exception as e:
+            if cfg.get("debug"):
+                print(f"DEBUG: 7d candle fetch failed: {e}")
+            closes_7d = []
+
+        ok, high7, dd_pct = kill_switch_ok(spot, closes_7d, cfg["kill_switch_drawdown_pct"])
+        if high7 is not None and dd_pct is not None:
+            print(f"Kill-switch 7d high: ${high7:,.2f} | drawdown={dd_pct:.2f}% (threshold {cfg['kill_switch_drawdown_pct']}%)")
+
+        if not ok:
+            print("Decision: SKIP | Kill-switch triggered (market drawdown too large).")
+            st["last_run_date"] = today
+            save_json(STATE_PATH, st)
+            print("Bot finished successfully.")
+            return
+
+    # Order sizing (NEW: dip scaling)
+    usd_amount = cfg["usd_per_day"]
+    if cfg.get("dip_scaling_enabled", True):
+        usd_amount = dip_scaled_amount(
+            base_usd=cfg["usd_per_day"],
+            dip_pct=dip_pct,
+            full_mult_at_pct=cfg["dip_scaling_full_mult_at_pct"],
+            max_mult=cfg["dip_scaling_max_mult"],
+        )
+
+    # Clamp to weekly remaining + min/max order
+    usd_amount = min(float(usd_amount), weekly_remaining)
     usd_amount = max(cfg["min_order_usd"], min(usd_amount, cfg["max_order_usd"]))
 
     print("Decision: BUY")
 
-    # DRY RUN
+    # DRY
     if bool(cfg["dry_run"]):
         print(f"[DRY RUN] Would buy ${usd_amount:,.2f} of {product_id}")
         st["last_run_date"] = today
@@ -445,7 +487,7 @@ def main() -> None:
         print("Bot finished successfully.")
         return
 
-    # LIVE mode requires client keys
+    # LIVE requires client
     if client is None:
         print("[LIVE MODE] ERROR: No Coinbase client available (missing keys or SDK).")
         st["last_run_date"] = today
@@ -467,7 +509,6 @@ def main() -> None:
         if order_id:
             print(f"[STAGE 6] order_id={order_id}")
 
-        # Update state
         st["weekly_spent"] = float(st.get("weekly_spent", 0.0)) + float(usd_amount)
         st["last_buy_ts"] = int(time.time())
         st["last_buy_price"] = float(spot)
