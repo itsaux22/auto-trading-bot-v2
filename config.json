@@ -24,4 +24,10 @@
 
   "min_order_usd": 5.0,
   "max_order_usd": 50.0
+
+  ,
+"pause_trading": false,
+"max_buys_per_day": 1,
+"trade_days_utc": [0,1,2,3,4,5,6]
+
 }
