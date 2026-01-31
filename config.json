@@ -29,5 +29,15 @@
 "pause_trading": false,
 "max_buys_per_day": 1,
 "trade_days_utc": [0,1,2,3,4,5,6]
+  
+  "ai_enabled": true,
+"ai_score_threshold": 70,
+"ai_debug_print": true,
+"rsi_period": 14,
+"rsi_oversold": 30,
+"rsi_very_oversold": 25,
+"mom_fast_hours": 6,
+"mom_slow_hours": 24,
+"history_hours": 200
 
 }
