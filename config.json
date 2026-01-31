@@ -5,11 +5,23 @@
   "dry_run": true,
 
   "run_once_per_day": true,
-  "dip_threshold_pct": -1.0,
-  "lookback_hours": 24,
-  "min_volatility": 0.0,
-  "max_volatility": 1.0,
   "cooldown_hours": 6,
+
+  "lookback_hours": 24,
+  "dip_threshold_pct": -1.0,
+
+  "trend_filter_enabled": true,
+  "trend_sma_hours": 72,
+  "trend_min_pct_above_sma": -0.5,
+
+  "kill_switch_enabled": true,
+  "kill_switch_lookback_hours": 168,
+  "kill_switch_drawdown_pct": -10.0,
+
+  "dip_scaling_enabled": true,
+  "dip_scaling_max_mult": 2.0,
+  "dip_scaling_full_mult_at_pct": -5.0,
+
   "min_order_usd": 5.0,
   "max_order_usd": 50.0
 }
