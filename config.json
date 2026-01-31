@@ -12,7 +12,8 @@
   "max_volatility": 1.0,
 
   "cooldown_hours": 6,
-
   "min_order_usd": 5.0,
-  "max_order_usd": 50.0
+  "max_order_usd": 50.0,
+
+  "pause_trading": false
 }
