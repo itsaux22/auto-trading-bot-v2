@@ -40,4 +40,32 @@
 "mom_slow_hours": 24,
 "history_hours": 200
 
+  "ai_score_threshold": 70,
+
+"dip_threshold_pct": -1.0,
+"lookback_hours": 24,
+
+"trend_filter_enabled": true,
+"trend_sma_hours": 72,
+"trend_min_pct_above_sma": -0.5,
+
+"kill_switch_enabled": true,
+"kill_switch_lookback_hours": 168,
+"kill_switch_drawdown_pct": -12.0,
+
+"rsi_period": 14,
+"rsi_oversold": 30,
+"rsi_very_oversold": 25,
+
+"mom_fast_hours": 6,
+"mom_slow_hours": 24,
+
+"dip_scaling_enabled": true,
+"dip_scaling_max_mult": 1.8,
+"dip_scaling_full_mult_at_pct": -6.0,
+
+"cooldown_hours": 12,
+"max_buys_per_day": 1
+
+
 }
