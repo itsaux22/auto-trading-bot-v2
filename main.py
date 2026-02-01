@@ -15,6 +15,7 @@ except Exception:
 
 CONFIG_PATH = "config.json"
 STATE_PATH = "state.json"
+LOG_PATH = "trades_log.jsonl"
 EXCHANGE_API_BASE = "https://api.exchange.coinbase.com"
 
 
@@ -28,6 +29,11 @@ def utc_now() -> dt.datetime:
 def iso_date(d: Optional[dt.datetime] = None) -> str:
     d = d or utc_now()
     return d.strftime("%Y-%m-%d")
+
+
+def iso_ts(d: Optional[dt.datetime] = None) -> str:
+    d = d or utc_now()
+    return d.isoformat().replace("+00:00", "Z")
 
 
 def week_id(d: Optional[dt.datetime] = None) -> str:
@@ -53,6 +59,11 @@ def save_json(path: str, data: Any) -> None:
     os.replace(tmp, path)
 
 
+def append_jsonl(path: str, obj: Dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+
 def to_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     try:
         return float(x)
@@ -74,12 +85,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     # safety
     "run_once_per_day": True,
-    "cooldown_hours": 6,
+    "cooldown_hours": 12,
     "pause_trading": False,
     "max_buys_per_day": 1,
     "trade_days_utc": [0, 1, 2, 3, 4, 5, 6],  # Mon..Sun
 
-    # dip + trend guards (still used)
+    # dip + guards
     "lookback_hours": 24,
     "dip_threshold_pct": -1.0,
 
@@ -89,32 +100,35 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 
     "kill_switch_enabled": True,
     "kill_switch_lookback_hours": 168,
-    "kill_switch_drawdown_pct": -10.0,
+    "kill_switch_drawdown_pct": -12.0,
 
     "dip_scaling_enabled": True,
-    "dip_scaling_max_mult": 2.0,
-    "dip_scaling_full_mult_at_pct": -5.0,
+    "dip_scaling_max_mult": 1.8,
+    "dip_scaling_full_mult_at_pct": -6.0,
 
     # order clamps
     "min_order_usd": 5.0,
-    "max_order_usd": 50.0,
+    "max_order_usd": 25.0,
 
-    # ✅ Upgrade #3: AI scoring
+    # AI scoring
     "ai_enabled": True,
-    "ai_score_threshold": 70,       # buy only if score >= this
+    "ai_score_threshold": 70,
     "ai_debug_print": True,
 
-    # RSI settings
     "rsi_period": 14,
-    "rsi_oversold": 30,             # <= 30 counts as oversold
+    "rsi_oversold": 30,
     "rsi_very_oversold": 25,
 
-    # momentum windows (hours)
     "mom_fast_hours": 6,
     "mom_slow_hours": 24,
+    "history_hours": 200,
 
-    # how much history to pull (hours) for indicators
-    "history_hours": 200,           # enough for RSI + trend
+    # logging
+    "log_each_run": True,
+
+    # notifications (Upgrade 5 will use these; safe to keep now)
+    "notify_on_buy": True,
+    "notify_on_error": True,
 
     "debug": False
 }
@@ -159,6 +173,11 @@ def load_config() -> Dict[str, Any]:
     merged["mom_slow_hours"] = int(merged["mom_slow_hours"])
     merged["history_hours"] = int(merged["history_hours"])
 
+    merged["pause_trading"] = bool(merged.get("pause_trading", False))
+    merged["log_each_run"] = bool(merged.get("log_each_run", True))
+    merged["notify_on_buy"] = bool(merged.get("notify_on_buy", True))
+    merged["notify_on_error"] = bool(merged.get("notify_on_error", True))
+
     return merged
 
 
@@ -172,6 +191,12 @@ def load_state() -> Dict[str, Any]:
     st.setdefault("last_buy_ts", 0)
     st.setdefault("last_buy_price", None)
     st.setdefault("buys_by_day", {})  # {"YYYY-MM-DD": int}
+
+    # ✅ Upgrade 4: estimated holdings tracking
+    st.setdefault("est_total_usd_spent", 0.0)
+    st.setdefault("est_total_base_qty", 0.0)     # e.g., BTC amount estimated
+    st.setdefault("est_avg_entry", None)
+
     return st
 
 
@@ -238,9 +263,6 @@ def pct_from(a: float, b: float) -> float:
 
 
 def rsi(values: List[float], period: int = 14) -> Optional[float]:
-    """
-    Standard RSI on closes. Needs at least period+1 values.
-    """
     if len(values) < period + 1:
         return None
 
@@ -263,9 +285,6 @@ def rsi(values: List[float], period: int = 14) -> Optional[float]:
 
 
 def dip_stats(current: float, closes: List[float]) -> Tuple[Optional[float], Optional[float]]:
-    """
-    Returns (recent_high, dip_pct) where dip_pct is negative when below high.
-    """
     if not closes:
         return None, None
     high = max(closes)
@@ -276,9 +295,6 @@ def dip_stats(current: float, closes: List[float]) -> Tuple[Optional[float], Opt
 
 
 def momentum_pct(closes: List[float], hours: int) -> Optional[float]:
-    """
-    Percent change over the last N hours using closes array (hourly).
-    """
     if len(closes) < hours + 1:
         return None
     now = closes[-1]
@@ -289,62 +305,44 @@ def momentum_pct(closes: List[float], hours: int) -> Optional[float]:
 
 
 # -----------------------------
-# AI Scoring Engine (Upgrade #3)
+# AI scoring
 # -----------------------------
-def compute_ai_score(
-    spot: float,
-    closes: List[float],
-    cfg: Dict[str, Any]
-) -> Tuple[int, Dict[str, Any]]:
-    """
-    Score 0..100. Higher = better buy.
-    """
+def compute_ai_score(spot: float, closes: List[float], cfg: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
     details: Dict[str, Any] = {}
-
-    # Need history
     if len(closes) < 30:
         return 0, {"reason": "not_enough_history", "len": len(closes)}
 
-    # Dip
     lookback = int(cfg["lookback_hours"])
     dip_window = closes[-min(len(closes), lookback):]
     high, dip_pct = dip_stats(spot, dip_window)
     details["lookback_high"] = high
     details["dip_pct"] = dip_pct
 
-    # RSI
     r = rsi(closes, int(cfg["rsi_period"]))
     details["rsi"] = r
 
-    # Trend vs SMA
     sma_hours = int(cfg["trend_sma_hours"])
     trend_window = closes[-min(len(closes), sma_hours):]
     s = sma(trend_window)
     details["sma"] = s
     details["pct_vs_sma"] = pct_from(spot, s) if s else None
 
-    # Momentum
     m_fast = momentum_pct(closes, int(cfg["mom_fast_hours"]))
     m_slow = momentum_pct(closes, int(cfg["mom_slow_hours"]))
     details["mom_fast_pct"] = m_fast
     details["mom_slow_pct"] = m_slow
 
-    # Build score
     score = 0
 
-    # 1) Dip depth: up to 40 points
-    # dip_pct is negative when below high. We map:
-    # -1% => ~10 pts, -3% => ~25 pts, -5% or more => 40 pts
+    # Dip points (0..40)
+    dip_points = 0
     if dip_pct is not None:
         d = abs(min(0.0, dip_pct))
         dip_points = int(min(40, (d / 5.0) * 40))
-        score += dip_points
-        details["dip_points"] = dip_points
-    else:
-        details["dip_points"] = 0
+    score += dip_points
+    details["dip_points"] = dip_points
 
-    # 2) RSI: up to 35 points
-    # <= 25 => 35 pts, <= 30 => 25 pts, <= 35 => 12 pts, else 0
+    # RSI points (0..35)
     rsi_points = 0
     if r is not None:
         if r <= cfg["rsi_very_oversold"]:
@@ -353,13 +351,10 @@ def compute_ai_score(
             rsi_points = 25
         elif r <= 35:
             rsi_points = 12
-        else:
-            rsi_points = 0
     score += rsi_points
     details["rsi_points"] = rsi_points
 
-    # 3) Trend: up to 15 points
-    # if price is not far below SMA, give points; if far below, subtract.
+    # Trend points (-10..15)
     trend_points = 0
     pct_vs = details.get("pct_vs_sma")
     if pct_vs is not None:
@@ -370,11 +365,11 @@ def compute_ai_score(
         elif pct_vs >= -1.5:
             trend_points = 5
         else:
-            trend_points = -10  # downtrend penalty
+            trend_points = -10
     score += trend_points
     details["trend_points"] = trend_points
 
-    # 4) Momentum: up to 10 points (avoid buying while still dumping)
+    # Momentum points (-10..10)
     mom_points = 0
     if m_fast is not None and m_slow is not None:
         if m_fast > 0 and m_slow > 0:
@@ -382,14 +377,35 @@ def compute_ai_score(
         elif m_fast > -0.5:
             mom_points = 5
         else:
-            mom_points = -10  # still dropping fast
+            mom_points = -10
     score += mom_points
     details["mom_points"] = mom_points
 
-    # clamp
     score = max(0, min(100, score))
     details["score"] = score
     return score, details
+
+
+# -----------------------------
+# Extra guards + sizing
+# -----------------------------
+def kill_switch_ok(current: float, closes_7d: List[float], threshold_pct: float) -> Tuple[bool, Optional[float], Optional[float]]:
+    if not closes_7d:
+        return True, None, None
+    high = max(closes_7d)
+    if high <= 0:
+        return True, None, None
+    dd_pct = (current - high) / high * 100.0
+    return (dd_pct > threshold_pct), high, dd_pct
+
+
+def dip_scaled_amount(base_usd: float, dip_pct: float, full_mult_at_pct: float, max_mult: float) -> float:
+    if dip_pct >= 0:
+        return base_usd
+    denom = abs(full_mult_at_pct) if full_mult_at_pct != 0 else 1.0
+    t = min(1.0, abs(dip_pct) / denom)
+    mult = 1.0 + (max_mult - 1.0) * t
+    return base_usd * mult
 
 
 # -----------------------------
@@ -435,40 +451,53 @@ def place_market_buy(client: Any, product_id: str, usd_amount: float) -> Dict[st
     return safe_to_dict(resp) or {"raw": str(resp), **payload}
 
 
-def read_only_check_accounts(client: Any) -> int:
-    if client is None or not hasattr(client, "list_accounts"):
-        return 0
-    resp = client.list_accounts()
-    data = safe_to_dict(resp)
-    if isinstance(data.get("accounts"), list):
-        return len(data["accounts"])
-    for k in ("accounts", "data", "result"):
-        v = data.get(k)
-        if isinstance(v, list):
-            return len(v)
-    return 0
-
-
 # -----------------------------
-# Extra safety guards
+# Upgrade 4: logging + stats
 # -----------------------------
-def kill_switch_ok(current: float, closes_7d: List[float], threshold_pct: float) -> Tuple[bool, Optional[float], Optional[float]]:
-    if not closes_7d:
-        return True, None, None
-    high = max(closes_7d)
-    if high <= 0:
-        return True, None, None
-    dd_pct = (current - high) / high * 100.0
-    return (dd_pct > threshold_pct), high, dd_pct
+def estimate_update_position(st: Dict[str, Any], usd_amount: float, spot_price: float) -> None:
+    """
+    This tracks an estimated position based on decision-time price.
+    It will not perfectly match real fills, but it's great for learning + tuning.
+    """
+    if spot_price <= 0:
+        return
+
+    est_qty = float(usd_amount) / float(spot_price)
+
+    st["est_total_usd_spent"] = float(st.get("est_total_usd_spent", 0.0)) + float(usd_amount)
+    st["est_total_base_qty"] = float(st.get("est_total_base_qty", 0.0)) + float(est_qty)
+
+    qty = float(st.get("est_total_base_qty", 0.0))
+    spent = float(st.get("est_total_usd_spent", 0.0))
+    st["est_avg_entry"] = (spent / qty) if qty > 0 else None
 
 
-def dip_scaled_amount(base_usd: float, dip_pct: float, full_mult_at_pct: float, max_mult: float) -> float:
-    if dip_pct >= 0:
-        return base_usd
-    denom = abs(full_mult_at_pct) if full_mult_at_pct != 0 else 1.0
-    t = min(1.0, abs(dip_pct) / denom)
-    mult = 1.0 + (max_mult - 1.0) * t
-    return base_usd * mult
+def print_performance(st: Dict[str, Any], spot_price: float, product_id: str) -> None:
+    qty = float(st.get("est_total_base_qty", 0.0))
+    spent = float(st.get("est_total_usd_spent", 0.0))
+    avg = st.get("est_avg_entry", None)
+
+    if qty <= 0 or spent <= 0 or spot_price <= 0:
+        print("[PERF] No estimated position yet.")
+        return
+
+    value = qty * spot_price
+    pnl = value - spent
+    pnl_pct = (pnl / spent) * 100.0 if spent > 0 else 0.0
+
+    avg_txt = f"${float(avg):,.2f}" if isinstance(avg, (int, float)) else "n/a"
+    print(f"[PERF] Est position for {product_id}:")
+    print(f"[PERF]   est_qty: {qty:.8f}")
+    print(f"[PERF]   est_avg_entry: {avg_txt}")
+    print(f"[PERF]   est_spent: ${spent:,.2f}")
+    print(f"[PERF]   est_value_now: ${value:,.2f}")
+    print(f"[PERF]   est_pnl: ${pnl:,.2f} ({pnl_pct:.2f}%)")
+
+
+def log_run(cfg: Dict[str, Any], st: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    if not cfg.get("log_each_run", True):
+        return
+    append_jsonl(LOG_PATH, payload)
 
 
 # -----------------------------
@@ -477,6 +506,8 @@ def dip_scaled_amount(base_usd: float, dip_pct: float, full_mult_at_pct: float, 
 def main() -> None:
     print("Bot started")
 
+    cfg: Dict[str, Any]
+    st: Dict[str, Any]
     try:
         cfg = load_config()
     except Exception as e:
@@ -488,21 +519,40 @@ def main() -> None:
     reset_week_if_needed(st)
 
     today = iso_date()
+    now_ts = iso_ts()
+
+    # Base log payload (we’ll fill in as we go)
+    log_payload: Dict[str, Any] = {
+        "ts": now_ts,
+        "date": today,
+        "product_id": cfg.get("product_id"),
+        "dry_run": bool(cfg.get("dry_run")),
+        "decision": "UNKNOWN",
+        "reason": "",
+        "spot": None,
+        "usd_amount": None,
+        "ai_score": None,
+        "ai_details": None,
+    }
 
     # pause
     if cfg.get("pause_trading", False):
+        log_payload.update({"decision": "SKIP", "reason": "pause_trading=true"})
         print("Decision: SKIP | pause_trading=true")
         st["last_run_date"] = today
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
         print("Bot finished successfully.")
         return
 
     # allowed days
     weekday = utc_now().weekday()
     if weekday not in cfg.get("trade_days_utc", [0,1,2,3,4,5,6]):
+        log_payload.update({"decision": "SKIP", "reason": f"weekday_not_allowed:{weekday}"})
         print(f"Decision: SKIP | Not an allowed trade day (weekday={weekday})")
         st["last_run_date"] = today
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
         print("Bot finished successfully.")
         return
 
@@ -512,42 +562,36 @@ def main() -> None:
         buys_by_day = {}
     buys_today = int(buys_by_day.get(today, 0))
     if buys_today >= int(cfg.get("max_buys_per_day", 1)):
+        log_payload.update({"decision": "SKIP", "reason": "max_buys_per_day"})
         print(f"Decision: SKIP | Max buys/day reached ({buys_today}/{cfg.get('max_buys_per_day')})")
         st["last_run_date"] = today
         st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
         print("Bot finished successfully.")
         return
 
     # run once/day (optional)
     if cfg.get("run_once_per_day", True) and st.get("last_run_date") == today:
+        log_payload.update({"decision": "SKIP", "reason": "already_ran_today"})
         print(f"Already ran today ({today}). Exiting.")
+        log_run(cfg, st, log_payload)
         print("Bot finished successfully.")
         return
 
     product_id = cfg["product_id"]
 
-    # client check
-    client = make_client()
-    if client is None:
-        print("[STAGE 5] Coinbase keys not detected (or SDK missing). DRY-only indicators ok.")
-    else:
-        try:
-            n = read_only_check_accounts(client)
-            print(f"[STAGE 5] Read-only check OK. accounts_count={n}")
-        except Exception as e:
-            print("[STAGE 5] Read-only check FAILED.")
-            print(f"Error: {e}")
-
     # spot price
     try:
         spot = get_spot_price(product_id)
+        log_payload["spot"] = spot
         print(f"Current spot price for {product_id}: ${spot:,.2f}")
     except Exception as e:
+        log_payload.update({"decision": "SKIP", "reason": f"spot_error:{e}"})
         print(f"MARKET DATA ERROR: Could not fetch spot price: {e}")
         st["last_run_date"] = today
-        st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
         print("Bot finished successfully.")
         return
 
@@ -556,10 +600,11 @@ def main() -> None:
     weekly_remaining = max(0.0, cfg["max_usd_per_week"] - weekly_spent)
     print(f"Weekly spent: ${weekly_spent:,.2f} / ${cfg['max_usd_per_week']:,.2f} (remaining ${weekly_remaining:,.2f})")
     if weekly_remaining < cfg["min_order_usd"]:
+        log_payload.update({"decision": "SKIP", "reason": "weekly_limit"})
         print("Decision: SKIP | Weekly limit reached (or remaining too small).")
         st["last_run_date"] = today
-        st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
         print("Bot finished successfully.")
         return
 
@@ -568,68 +613,76 @@ def main() -> None:
     if last_buy_ts > 0:
         hours_since = (time.time() - last_buy_ts) / 3600.0
         if hours_since < cfg["cooldown_hours"]:
+            log_payload.update({"decision": "SKIP", "reason": "cooldown"})
             print(f"Decision: SKIP | Cooldown active ({hours_since:.1f}h since last buy, need {cfg['cooldown_hours']}h).")
             st["last_run_date"] = today
-            st["buys_by_day"] = buys_by_day
             save_json(STATE_PATH, st)
+            log_run(cfg, st, log_payload)
+            print_performance(st, spot, product_id)
             print("Bot finished successfully.")
             return
 
-    # pull history for AI
+    # candles history
     history_hours = int(cfg.get("history_hours", 200))
     try:
         closes = get_hourly_closes(product_id, history_hours)
     except Exception as e:
-        print(f"MARKET DATA ERROR: Could not fetch candles: {e}")
         closes = []
+        log_payload.update({"decision": "SKIP", "reason": f"candles_error:{e}"})
+        print(f"MARKET DATA ERROR: Could not fetch candles: {e}")
 
     if not closes:
+        log_payload.update({"decision": "SKIP", "reason": "no_history"})
         print("Decision: SKIP | No candle history available")
         st["last_run_date"] = today
-        st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
+        print_performance(st, spot, product_id)
         print("Bot finished successfully.")
         return
 
-    # kill switch (still applies)
+    # kill switch
     if cfg.get("kill_switch_enabled", True):
         try:
             closes_7d = get_hourly_closes(product_id, int(cfg["kill_switch_lookback_hours"]))
         except Exception:
             closes_7d = []
-
         ok, high7, dd_pct = kill_switch_ok(spot, closes_7d, float(cfg["kill_switch_drawdown_pct"]))
         if high7 is not None and dd_pct is not None:
             print(f"Kill-switch 7d high: ${high7:,.2f} | drawdown={dd_pct:.2f}% (threshold {cfg['kill_switch_drawdown_pct']}%)")
         if not ok:
+            log_payload.update({"decision": "SKIP", "reason": "kill_switch"})
             print("Decision: SKIP | Kill-switch triggered")
             st["last_run_date"] = today
-            st["buys_by_day"] = buys_by_day
             save_json(STATE_PATH, st)
+            log_run(cfg, st, log_payload)
+            print_performance(st, spot, product_id)
             print("Bot finished successfully.")
             return
 
-    # AI score decision
+    # AI score
     threshold = int(cfg.get("ai_score_threshold", 70))
     score, details = compute_ai_score(spot, closes, cfg)
+    log_payload["ai_score"] = score
+    log_payload["ai_details"] = details
 
     if cfg.get("ai_debug_print", True):
-        # print only a few key lines
         print(f"AI Score: {score}/100 (threshold {threshold})")
-        # show main details
         for k in ["dip_pct", "rsi", "pct_vs_sma", "mom_fast_pct", "mom_slow_pct", "dip_points", "rsi_points", "trend_points", "mom_points"]:
             if k in details:
                 print(f"  {k}: {details[k]}")
 
     if score < threshold:
+        log_payload.update({"decision": "SKIP", "reason": "ai_below_threshold"})
         print("Decision: SKIP | AI score below threshold")
         st["last_run_date"] = today
-        st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
+        print_performance(st, spot, product_id)
         print("Bot finished successfully.")
         return
 
-    # Decide order size (dip scaling based on dip_pct)
+    # Amount sizing
     dip_pct = details.get("dip_pct")
     usd_amount = float(cfg["usd_per_day"])
     if cfg.get("dip_scaling_enabled", True) and isinstance(dip_pct, (int, float)):
@@ -639,49 +692,68 @@ def main() -> None:
             full_mult_at_pct=float(cfg["dip_scaling_full_mult_at_pct"]),
             max_mult=float(cfg["dip_scaling_max_mult"]),
         )
-
     usd_amount = min(float(usd_amount), weekly_remaining)
     usd_amount = max(float(cfg["min_order_usd"]), min(float(usd_amount), float(cfg["max_order_usd"])))
+    log_payload["usd_amount"] = usd_amount
 
     print("Decision: BUY")
 
     # DRY RUN
     if bool(cfg["dry_run"]):
+        log_payload.update({"decision": "BUY", "reason": "dry_run"})
         print(f"[DRY RUN] Would buy ${usd_amount:,.2f} of {product_id}")
+
+        # Optional: simulate position for learning (keeps your stats meaningful)
+        estimate_update_position(st, usd_amount, spot)
+
         st["last_run_date"] = today
-        st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
+        print_performance(st, spot, product_id)
         print("Bot finished successfully.")
         return
 
-    # LIVE needs client
+    # LIVE mode
+    client = make_client()
     if client is None:
+        log_payload.update({"decision": "SKIP", "reason": "no_client_live"})
         print("[LIVE MODE] ERROR: No Coinbase client available.")
         st["last_run_date"] = today
-        st["buys_by_day"] = buys_by_day
         save_json(STATE_PATH, st)
+        log_run(cfg, st, log_payload)
+        print_performance(st, spot, product_id)
         print("Bot finished successfully.")
         return
 
-    # Place order
     try:
         print("[STAGE 6] LIVE MODE enabled. Placing real order...")
-        _ = place_market_buy(client, product_id, usd_amount)
+        resp = place_market_buy(client, product_id, usd_amount)
+        order_id = resp.get("order_id") or resp.get("orderId") or resp.get("id")
+        log_payload.update({"decision": "BUY", "reason": "live_order", "order_id": order_id})
+
         print("[STAGE 6] Order placed.")
+        if order_id:
+            print(f"[STAGE 6] order_id={order_id}")
 
         st["weekly_spent"] = float(st.get("weekly_spent", 0.0)) + float(usd_amount)
         st["last_buy_ts"] = int(time.time())
         st["last_buy_price"] = float(spot)
 
-        buys_by_day[today] = buys_today + 1
+        buys_by_day[today] = int(buys_by_day.get(today, 0)) + 1
         st["buys_by_day"] = buys_by_day
 
+        # Update estimated stats too (helps you monitor performance)
+        estimate_update_position(st, usd_amount, spot)
+
     except Exception as e:
+        log_payload.update({"decision": "SKIP", "reason": f"order_failed:{e}"})
         print("[STAGE 6] Order FAILED.")
         print(f"Error: {e}")
 
     st["last_run_date"] = today
     save_json(STATE_PATH, st)
+    log_run(cfg, st, log_payload)
+    print_performance(st, spot, product_id)
     print("Bot finished successfully.")
 
 
