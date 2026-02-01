@@ -1,7 +1,11 @@
 {
   "week": "",
   "weekly_spent": 0.0,
-  "last_price": null,
   "last_run_date": "",
-  "last_order_time": ""
+  "last_buy_ts": 0,
+  "last_buy_price": null,
+  "buys_by_day": {},
+  "est_total_usd_spent": 0.0,
+  "est_total_base_qty": 0.0,
+  "est_avg_entry": null
 }
